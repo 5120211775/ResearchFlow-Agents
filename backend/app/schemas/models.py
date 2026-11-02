@@ -1,0 +1,125 @@
+"""Response and request bodies for the model-routing surface."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import AnyHttpUrl, BaseModel, Field
+
+
+class ModelInfo(BaseModel):
+    route: str
+    provider: str
+    model_id: str
+    display_name: str
+    input_per_mtok: float | None
+    output_per_mtok: float | None
+    context_window: int | None
+    max_output_tokens: int | None
+    supports_tools: bool
+    supports_structured_output: bool
+    notes: str
+    available: bool = Field(description="Whether this user currently has a usable key.")
+
+
+class CatalogResponse(BaseModel):
+    roles: list[str]
+    models: list[ModelInfo]
+    presets: dict[str, dict[str, dict[str, str]]]
+    preset_names: list[str]
+    available_providers: list[str]
+    # What this user's runs use today: their saved preference, else the deployment's.
+    effective_routing: dict[str, str]
+    # None when the user has no preference of their own and is on the deployment default.
+    user_routing: dict[str, str] | None
+    deployment_routing: dict[str, str]
+
+
+class LocalModelInfo(BaseModel):
+    name: str
+    size_bytes: int | None
+    route: str | None
+    in_catalog: bool
+    likely_underpowered: bool
+    is_embedding: bool
+    params_b: float | None
+
+
+class LocalLLMStatusResponse(BaseModel):
+    configured_base_url: str
+    reachable: bool
+    usable: bool
+    models: list[LocalModelInfo]
+    error: str | None
+    hint: str | None
+    # "Not detected" used to conflate two states with different fixes
+    # (internal/07 Phase 2b): install vs. start.
+    install_state: Literal["running", "installed_not_running", "not_installed"]
+
+
+class CustomEndpointStatusResponse(BaseModel):
+    """What the configured OpenAI-compatible endpoint says it can serve.
+
+    `models` is a bare list of ids rather than `ModelInfo`, and deliberately so: this
+    provider has no catalog entry, so there is no price, context window or capability flag
+    to report. Dressing the ids up in the same shape as catalogued models would invent
+    fields whose only honest value is null — and a `0.0` price here would silently read as
+    "free" for a gateway that bills.
+    """
+
+    configured_base_url: str
+    reachable: bool
+    models: list[str]
+    error: str | None
+    hint: str | None
+
+
+class ReadinessResponse(BaseModel):
+    """Whether this user can run research at all right now (docs/17 §8a)."""
+
+    ready: bool
+    # Which half is satisfied, so the UI can say something specific rather than
+    # "not configured" — the two have completely different next steps.
+    has_cloud_key: bool
+    local_reachable: bool
+    local_chat_models: int
+
+
+class ProviderTestRequest(BaseModel):
+    """A key to probe before it is stored (internal/07 Phase 2a)."""
+
+    model_config = {"str_strip_whitespace": True}
+
+    provider: Literal["google", "anthropic", "openai", "openrouter", "custom"]
+    api_key: str = Field(min_length=8, max_length=500)
+    api_base_url: AnyHttpUrl | None = Field(default=None)
+
+
+class RoutingRequest(BaseModel):
+    routing: dict[str, str]
+
+
+class RoutingResponse(BaseModel):
+    routing: dict[str, str] | None
+    effective_routing: dict[str, str]
+
+
+class PromptDefault(BaseModel):
+    """One role's editable shipped prompt (scope freeze §12, D-1)."""
+
+    role: str
+    # The shipped text with the untrusted-content note removed — the part a user replaces.
+    default_prompt: str
+    # True when the system adds that note before and after a replacement for this role.
+    untrusted_content_framed: bool
+
+
+class PromptDefaultsResponse(BaseModel):
+    """`GET /models/prompt-defaults` — what the per-role prompt editors start from.
+
+    A property of the build, identical for every caller and on both hosts: no user state,
+    no protected purpose, no hash. A user's own overrides come from `GET /auth/me`.
+    """
+
+    max_chars: int
+    roles: list[PromptDefault]

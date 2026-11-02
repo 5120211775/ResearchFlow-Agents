@@ -1,0 +1,689 @@
+"""
+Execution wiring: the research engine, persisted into the research domain.
+
+This is an **adapter**, not a second pipeline. `research_engine.runner.run` and `.resume` are
+called exactly as `app/workers/pipeline_runner.py` calls them, with the same ports, the same
+`RunConfig`, the same LangGraph topology and the same checkpointer. Nothing in
+`research_engine/` learns the domain exists — the dependency points one way, from here into the
+engine.
+
+    POST /runs ──► ResearchRun (PENDING)
+                       │
+                       ├─ Celery: run_research_pipeline
+                       │    ├─ resolve routing + BYOK + RunConfig   (shared)
+                       │    ├─ runner.run(...)                      (unchanged engine)
+                       │    ├─ RunOutcome  +  final checkpoint state
+                       │    └─ persist_outcome() ──► run_lifecycle ──► run rows
+                       │
+                       └─ POST /report-review APPROVED ──► Artifact ──► bundle ──► verifier
+
+**Two sources, because the engine has two outputs.** `RunOutcome` carries the report, the
+numbered source list, cost and tokens. Evidence and contradictions live in the LangGraph
+checkpoint and always have — the session bundle route reads them the same way. So the adapter
+reads the final state once, through the tri-state reader, and persists it transactionally.
+After that the `evidence` table is authoritative and the checkpoint is execution history.
+
+**The tri-state matters here too.** A run whose checkpoint cannot be read has not gathered
+zero evidence; it has an unknown amount. `persist_outcome` records which of the three it was
+and refuses to write a revision claiming citations it cannot resolve.
+
+`persist_outcome` is deliberately the seam: pure over (db, run, outcome, state), with no
+Celery, no Redis and no HTTP, so the integration test can drive the real engine and then call
+it directly.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, replace
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app import metrics, run_lifecycle
+from app.logconfig import bind_research_run_context
+from app.models.research import ResearchRun
+from app.models.user import User
+from app.runtime import run_config_from_settings
+from app.services import corpus_selection, model_routing
+from app.services.run_config import (
+    OVERRIDES_UNUSABLE,
+    apply_demo_rule,
+    preference_overrides,
+    snapshot_overrides,
+    usable_overrides,
+)
+from research_engine import citation_rate, events
+from research_engine.checkpoint_read import CheckpointOutcome, read_checkpoint
+from research_engine.prompt_composition import recording_provenance
+from research_engine.runconfig import RunConfig
+from research_engine.runner import RunOutcome
+
+logger = structlog.get_logger()
+
+#: One decrypt path and one fallback for BYOK keys, shared with the session worker rather
+#: than restated. The *preference* contract no longer arrives from here: it lives in
+#: `app/services/run_config.py`, which the desktop may import and `app.workers` is not
+#: (`tests/workflow/test_layer_boundaries.py` lists `app.workers` as infrastructure).
+from app.services.provider_keys import _user_provider_keys  # noqa: E402
+
+__all__ = [
+    "PersistResult",
+    "persist_outcome",
+    "run_config_for_run",
+    "provider_keys_for",
+]
+
+
+@dataclass
+class PersistResult:
+    """What the adapter wrote, and what it declined to write.
+
+    `evidence_outcome` is the tri-state, carried out so a caller can log it and a test can
+    assert on it. `revision` is None when the run produced no report — a failed run, or one
+    stopped at a gate.
+    """
+
+    status: str
+    evidence_outcome: str
+    source_count: int = 0
+    evidence_count: int = 0
+    revision_version: int | None = None
+    claim_count: int = 0
+    link_count: int = 0
+    contradiction_count: int = 0
+
+
+async def provider_keys_for(db: AsyncSession, owner_id: uuid.UUID) -> dict[str, str]:
+    """This run's BYOK keys. Shared with the session worker — one decrypt path, one fallback."""
+    return await _user_provider_keys(db, str(owner_id))
+
+
+async def freeze_prompt_overrides(db: AsyncSession, run: ResearchRun) -> None:
+    """Stamp the prompt overrides this run will execute under. Start only, exactly once.
+
+    Called inside the transaction that writes RUNNING, so a run is never observable as
+    started without the configuration it started under. **Start is decided by the caller's
+    arguments, not by finding the column NULL** — NULL is also what every run predating the
+    column holds, and re-resolving on one of those would hand a resumed run instructions its
+    first half never saw.
+    """
+    user = (await db.execute(select(User).where(User.id == run.owner_id))).scalar_one_or_none()
+    frozen, status = snapshot_overrides(user)
+    # `None` rather than `{}` for the empty case: the status already says which of the three
+    # this is, and a column holding two spellings of "nothing" invites a reader to branch on
+    # the wrong one.
+    run.effective_prompt_overrides = frozen or None
+    run.prompt_overrides_status = status
+    await db.flush()
+
+
+def prompt_overrides_for_run(run: ResearchRun) -> tuple[dict[str, str], bool]:
+    """The overrides a run executes under, read from its own row and nothing else.
+
+    **The execution-source rule, in one place for both hosts.** Once a run has started, the
+    snapshot is the only source: consulting the owner's live preferences on resume would let
+    an edit made while the run sat at a human gate rewrite the instructions its first half
+    was already written under. A snapshot that cannot be used yields shipped prompts for
+    every purpose — never a partial application, and never a re-resolution.
+
+    Returns `(overrides, needs_unusable_stamp)`. The caller owns the write because the two
+    hosts commit on different transactions; only the *status* is ever corrected, so whatever
+    was stored stays inspectable.
+    """
+    overrides, status = usable_overrides(run.effective_prompt_overrides)
+    stamp = status == OVERRIDES_UNUSABLE and run.prompt_overrides_status != OVERRIDES_UNUSABLE
+    return overrides, stamp
+
+
+async def run_config_for_run(db: AsyncSession, run: ResearchRun) -> RunConfig:
+    """The engine config for a run.
+
+    Deliberately the same resolution order as the session worker — run → user → deployment — and
+    the same snapshot rule: once `model_routing` is stamped on the run it wins, so a resumed
+    run keeps the models it started with rather than producing a report whose halves were
+    written by different models.
+    """
+    user = (await db.execute(select(User).where(User.id == run.owner_id))).scalar_one_or_none()
+
+    routing = model_routing.resolve(
+        session_routing=run.model_routing,
+        user_routing=(user.model_routing if user else None),
+    )
+    if run.model_routing != routing:
+        run.model_routing = routing
+        await db.flush()
+
+    base = run_config_from_settings()
+    overrides = preference_overrides(user)
+
+    # Read from the row, never from `user` — see `prompt_overrides_for_run`. Desktop
+    # counterpart: `sidecar._drive_run`, calling the same function rather than restating it.
+    prompt_overrides, unusable_stamp = prompt_overrides_for_run(run)
+    if unusable_stamp:
+        run.prompt_overrides_status = OVERRIDES_UNUSABLE
+        await db.flush()
+
+    overrides |= {"prompt_overrides": prompt_overrides, **row_overrides(run)}
+    # The demo rule, shared with the session worker and both desktop drivers — see
+    # `app/services/run_config.py` for why it is one branch and why it has to be one home.
+    config, needs_stamp = apply_demo_rule(
+        base, row_demo=bool(run.demo), host_is_scripted=base.llm_mode == "fake"
+    )
+    if needs_stamp:
+        run.demo = True
+        await db.flush()
+    return replace(config, models=routing, **overrides)
+
+
+async def persist_outcome(
+    db: AsyncSession,
+    run: ResearchRun,
+    outcome: RunOutcome,
+    *,
+    saver=None,
+    state: dict | None = None,
+    prompt_provenance: dict[str, dict] | None = None,
+) -> PersistResult:
+    """Write one graph invocation's result into the research domain. Caller owns the transaction.
+
+    `state` is the final checkpoint values; pass it directly (a test that already has them)
+    or pass `saver` and let this read them through the tri-state reader. Passing neither
+    means the evidence is **unknown**, and that is recorded rather than treated as zero.
+
+    `prompt_provenance` is what `system_prompt` composed during *this* invocation, captured
+    by `recording_provenance`. It is **merged**, not assigned: a run pausing at a human gate
+    composes the planner's prompt in one invocation and the synthesizer's in a later one, and
+    the bundle needs the union. Omitting it leaves the column exactly as it was, so a caller
+    that does not drive the graph cannot erase what an earlier segment recorded.
+    """
+    # **Before every early return below.** A prompt this invocation composed is a fact about
+    # what executed, like the spend the cancelled branch deliberately keeps — not a
+    # conclusion about the run, so no outcome status suppresses it. Placed lower, it was
+    # dropped for the invocation that ends at the plan gate, and the planner's prompt —
+    # always the first one composed — never reached any bundle. The golden run journey
+    # caught that; nothing else would have, because every unit test drove a single
+    # uninterrupted invocation.
+    #
+    # Merged earlier-first: a purpose already recorded keeps the string it actually ran
+    # under, matching the recorder's own first-write-wins rule within one invocation.
+    if prompt_provenance:
+        # This invocation's records first, the existing ones second, so an already-recorded
+        # purpose keeps the string it actually ran under. A resumed run recomposes nothing,
+        # but if it ever did, the earlier segment is the one the report was written from.
+        run.effective_prompt_provenance = {
+            **prompt_provenance,
+            **(run.effective_prompt_provenance or {}),
+        }
+
+    # A run the user stopped stays stopped (issue #54). Cancellation is advisory — nothing
+    # interrupts the graph — so the outcome still arrives, minutes later with a real model,
+    # and every branch below would move the run out of CANCELLED.
+    #
+    # Without this the write did not merely mis-record: `ck_run_cancelled` ties CANCELLED to
+    # `cancelled_at`, so the UPDATE violated the constraint and raised IntegrityError inside
+    # the worker's background task. The status survived (the transaction rolled back) but the
+    # spend went with it — a run cancelled after $0.50 recorded $0.00. Guarding here is what
+    # turns an accidental save-by-constraint into a decision, and keeps the money.
+    #
+    # Spend is committed because tokens burned between the stop and the pipeline noticing are
+    # real; dropping them would make usage totals lie. Nothing else is written: the run's own
+    # conclusion is not the user's decision, and the user's decision is the one that stands.
+    #
+    # Two more homes of this rule for sessions — `pipeline_runner._persist_outcome` and
+    # `sidecar._apply_outcome`. Change all three.
+    if run.status == "CANCELLED":
+        await run_lifecycle.record_metrics(
+            db,
+            run,
+            cost_usd=outcome.cost_usd,
+            tokens_input=outcome.tokens_input,
+            tokens_output=outcome.tokens_output,
+            elapsed_seconds=outcome.elapsed_seconds,
+        )
+        logger.info(
+            "outcome_discarded_run_cancelled",
+            run_id=str(run.id),
+            outcome_status=outcome.status,
+            cost_usd=round(outcome.cost_usd, 4),
+        )
+        return PersistResult(status="CANCELLED", evidence_outcome="NOT_READ")
+
+    if outcome.status == "failed":
+        await run_lifecycle.record_failure(db, run, outcome.error)
+        return PersistResult(status="FAILED", evidence_outcome="NOT_READ")
+
+    # ── the plan gate ─────────────────────────────────────────────────────────────
+    if outcome.status == "awaiting_plan":
+        # The proposal, not a decision: `approved_at` stays NULL until a PLAN review
+        # stamps it, and `origin` says the model wrote it.
+        await run_lifecycle.record_plan(
+            db,
+            run,
+            tasks=outcome.plan_tasks,
+            outline_sections=outcome.plan_outline,
+            origin="MODEL_PROPOSED",
+        )
+        await run_lifecycle.record_metrics(
+            db,
+            run,
+            cost_usd=outcome.cost_usd,
+            tokens_input=outcome.tokens_input,
+            tokens_output=outcome.tokens_output,
+        )
+        await run_lifecycle.set_status(db, run, "AWAITING_PLAN")
+        return PersistResult(status="AWAITING_PLAN", evidence_outcome="NOT_READ")
+
+    # ── evidence, from the checkpoint, tri-state ──────────────────────────────────
+    evidence_outcome = "NOT_READ"
+    values: dict = {}
+    if state is not None:
+        evidence_outcome, values = "READ", state
+    elif saver is not None:
+        read = await read_checkpoint(saver, str(run.id))
+        if read.outcome is CheckpointOutcome.READ:
+            evidence_outcome, values = "READ", read.values
+        elif read.outcome is CheckpointOutcome.MISSING:
+            evidence_outcome = "CHECKPOINT_MISSING"
+        else:
+            evidence_outcome = "CHECKPOINT_UNREADABLE"
+
+    written = None
+    if evidence_outcome == "READ":
+        evidence = [e for e in (values.get("evidence") or []) if isinstance(e, dict)]
+        # An evidence item with no `source_url` has no identity anywhere, and
+        # `record_evidence` refuses the whole batch rather than invent one. The engine's
+        # own numbering skips such items too, so dropping them here loses nothing the
+        # report could have cited — but it IS a drop, so it is counted and logged.
+        usable = [e for e in evidence if (e.get("source_url") or "").strip()]
+        if len(usable) != len(evidence):
+            logger.warning(
+                "evidence_without_source_url_skipped",
+                run_id=str(run.id),
+                skipped=len(evidence) - len(usable),
+            )
+        # A selected-files run may persist evidence and sources only from its frozen
+        # selection. `ScopedCorpus` should make this unreachable; reaching it means a path
+        # around the port exists, so the run fails loudly instead of quietly dropping the
+        # offending items (internal/rfcs/V3.1-corpus-scope.md §8.5).
+        bad = corpus_selection.violations(
+            run.corpus_selection,
+            [e["source_url"] for e in usable]
+            + [s["url"] for s in outcome.sources or [] if isinstance(s, dict) and s.get("url")],
+        )
+        if bad:
+            logger.error("selection_violation", run_id=str(run.id), urls=bad[:20], count=len(bad))
+            await run_lifecycle.record_failure(
+                db,
+                run,
+                f"selection_violation: {len(bad)} source(s) outside this run's selected files "
+                "reached its evidence. Nothing from this run was kept as evidence.",
+            )
+            return PersistResult(status="FAILED", evidence_outcome=evidence_outcome)
+        written = await run_lifecycle.record_evidence(
+            db, run, evidence=usable, numbered_sources=outcome.sources
+        )
+        # Each synthesis writes a fresh record; a rework's re-validation replaces it.
+        run.grounding_report = values.get("grounding_report")
+
+    # ── the revision, its claims and their links ──────────────────────────────────
+    revision_version = claim_count = link_count = 0
+    report = outcome.report
+    if report:
+        result = await run_lifecycle.record_revision(
+            db, run, report_markdown=report, evidence_index=written
+        )
+        revision_version = result.revision.version
+        claim_count, link_count = result.claim_count, result.link_count
+
+    # ── contradictions ────────────────────────────────────────────────────────────
+    contradiction_count = 0
+    if evidence_outcome == "READ":
+        pairs = [c for c in (values.get("contradictions") or []) if isinstance(c, dict)]
+        # `detector_ran=True` even for an empty list: the engine runs the detector on every
+        # non-corpus path and surfaces nothing when it is unavailable, so "no pairs" here is
+        # a measured absence. A caller that knows the detector was skipped passes False.
+        contradiction_count = await run_lifecycle.record_contradictions(
+            db, run, pairs=pairs, evidence_index=written
+        )
+
+    # ── metrics and status ────────────────────────────────────────────────────────
+    rate = None
+    if outcome.status == "completed" and report:
+        # Measured once, when the report becomes final — the same rule and the same
+        # function the session worker uses. NULL when there was nothing to measure.
+        rate = citation_rate.resolution_rate(report, outcome.sources)
+    await run_lifecycle.record_metrics(
+        db,
+        run,
+        cost_usd=outcome.cost_usd,
+        tokens_input=outcome.tokens_input,
+        tokens_output=outcome.tokens_output,
+        elapsed_seconds=outcome.elapsed_seconds,
+        citation_resolution_rate=rate,
+    )
+
+    # Persisted, not merely logged. Whether the evidence was ever read is what separates a
+    # measured zero from an unmeasured one, and `run_bundle` has to be able to ask the run
+    # itself — a log line cannot be consulted at export time.
+    run.evidence_outcome = evidence_outcome
+
+    status = run_lifecycle.OUTCOME_STATUS.get(outcome.status, "RUNNING")
+    if status == "COMPLETED" and not report:
+        # A completed run with no report is not completed. Fail closed rather than mark a
+        # run finished with nothing to review.
+        await run_lifecycle.record_failure(db, run, "the graph completed without a report")
+        status = "FAILED"
+    else:
+        await run_lifecycle.set_status(db, run, status)
+
+    return PersistResult(
+        status=status,
+        evidence_outcome=evidence_outcome,
+        source_count=written.source_count if written else 0,
+        evidence_count=written.evidence_count if written else 0,
+        revision_version=revision_version or None,
+        claim_count=claim_count,
+        link_count=link_count,
+        contradiction_count=contradiction_count,
+    )
+
+
+def observe_persisted(run: ResearchRun, outcome: RunOutcome, result: PersistResult) -> None:
+    """Record a run that ended in the states `persist_outcome` owns.
+
+    **Called after the caller commits, never inside `persist_outcome`.** A Prometheus
+    counter has no transaction: incrementing it before the commit means a rolled-back
+    write leaves a run counted that the database never recorded, and a counter cannot be
+    decremented back. `persist_outcome`'s own docstring says the caller owns the
+    transaction, so the caller owns this too — both drivers call it on the line after their
+    `db.commit()`, while the row is still attached.
+
+    Completion is deliberately not reachable from here: a run reaches COMPLETED at the
+    approval route, and `app/metrics.py::_PERSISTED_TERMINAL` is where that is enforced.
+    """
+    metrics.observe_persisted_run(
+        result.status,
+        cost_usd=outcome.cost_usd,
+        tokens_input=outcome.tokens_input,
+        tokens_output=outcome.tokens_output,
+        model_routing=run.model_routing,
+    )
+
+
+def lifecycle_event(result: PersistResult) -> dict:
+    """The event a host publishes after `persist_outcome`, in the existing vocabulary.
+
+    Reuses `research_engine.events.make_event` and the same four names the session stream and
+    both hosts' stop-lists already know (`PLAN_READY`, `HITL_READY`, `COMPLETED`, `FAILED`),
+    so no second event architecture appears and no stream is left waiting on a name nothing
+    publishes.
+    """
+    if result.status == "AWAITING_PLAN":
+        return events.make_event("PLAN_READY", data={"run_id": None})
+    if result.status == "AWAITING_REVIEW":
+        return events.make_event(
+            "HITL_READY",
+            data={
+                "revision_version": result.revision_version,
+                "source_count": result.source_count,
+                "evidence_count": result.evidence_count,
+                "contradiction_count": result.contradiction_count,
+            },
+        )
+    if result.status == "FAILED":
+        return events.make_event("FAILED", data={"reason": "see error_message"})
+    # A cancelled run reports FAILED rather than a name of its own (issue #54). `CANCELLED`
+    # is not in `_TERMINAL_EVENTS` on either host, so inventing it here would leave the
+    # stream open on a run that will never publish again — and the fall-through below would
+    # otherwise tell the UI a run the user stopped had COMPLETED. `POST /{id}/cancel`
+    # publishes nothing itself, so this is the event that actually closes the stream.
+    if result.status == "CANCELLED":
+        return events.make_event("FAILED", data={"reason": "Research stopped by user."})
+    return events.make_event(
+        "COMPLETED",
+        data={
+            "revision_version": result.revision_version,
+            "claim_count": result.claim_count,
+            # The tri-state, carried into the event: a UI must be able to tell "no
+            # evidence" from "evidence unknown".
+            "evidence_outcome": result.evidence_outcome,
+        },
+    )
+
+
+# ── The worker driver ─────────────────────────────────────────────────────────────
+#
+# Everything above is host-free. This part is the server's half — the run lock, one DB
+# session scope, the Postgres checkpointer, the event sink — and it is deliberately a near
+# mirror of `pipeline_runner._execute` rather than a new design. The differences are the
+# row it loads (`ResearchRun`) and where the outcome goes (`persist_outcome`).
+
+
+async def execute_run(
+    run_id: str,
+    *,
+    resume: tuple[bool, str | None] | None = None,
+    plan: dict | None = None,
+) -> None:
+    """Drive one run through the engine and persist it into the research domain."""
+    # First, before the Redis pool, the lock and the row lookup, so everything this driver
+    # logs on the way — including the failures that return early — names the run.
+    bind_research_run_context(run_id)
+
+    from app import adapters
+    from app.config import settings
+    from app.db.base import AsyncSessionLocal, engine
+    from app.db.redis import (
+        acquire_session_lock,
+        close_redis_pool,
+        init_redis_pool,
+        release_session_lock,
+    )
+    from research_engine import runner
+
+    lock_token = uuid.uuid4().hex
+    await init_redis_pool()
+    try:
+        # Celery can redeliver, so double execution is a real risk here in a way it is not
+        # in a single-process desktop app. Same lock, same key space as the session worker.
+        if not await acquire_session_lock(
+            run_id, lock_token, ttl=settings.celery_task_timeout_seconds + 60
+        ):
+            logger.warning("run_lock_busy", run_id=run_id)
+            return
+        try:
+            async with AsyncSessionLocal() as db:
+                run = (
+                    await db.execute(select(ResearchRun).where(ResearchRun.id == uuid.UUID(run_id)))
+                ).scalar_one_or_none()
+                if run is None:
+                    logger.error("run_not_found", run_id=run_id)
+                    return
+
+                # "No new research will be started for this run" is what `POST /cancel`
+                # tells the caller, in those words. Without this it was not true: a resume
+                # dispatched after the cancel — approving the plan of a run you had just
+                # stopped — started the pipeline again, and the `set_status` below wrote
+                # RUNNING over CANCELLED, violating `ck_run_cancelled` and killing the task
+                # on an IntegrityError. Observed live before this guard existed.
+                #
+                # Returning rather than raising: the run is already in the terminal state
+                # the user asked for, nothing is wrong, and there is nothing new to publish
+                # — the stream closed when the cancel did.
+                if run.status == "CANCELLED":
+                    logger.info("run_start_skipped_cancelled", run_id=run_id)
+                    return
+
+                await run_lifecycle.set_status(db, run, "RUNNING")
+                # Same transaction as RUNNING, and only on a start: a resume re-enters here
+                # with `resume`/`plan` set and must inherit the snapshot, not replace it.
+                if resume is None and plan is None:
+                    await freeze_prompt_overrides(db, run)
+                await db.commit()
+
+                sink = adapters.agent_log_sink(db, run_id)
+                ports = {
+                    "provider_keys": await provider_keys_for(db, run.owner_id),
+                    "event_sink": sink,
+                    "cache": adapters.RedisCache(),
+                    "run_config": await run_config_for_run(db, run),
+                }
+                await db.commit()
+
+                if run.corpus_mode:
+                    guard = await _corpus_port(db, run, ports)
+                    if guard is not None:
+                        await run_lifecycle.record_failure(db, run, guard)
+                        await db.commit()
+                        await sink(run_id, events.make_event("FAILED", data={"reason": guard}))
+                        return
+
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+                dsn = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+                async with AsyncPostgresSaver.from_conn_string(dsn) as saver:
+                    await saver.setup()
+                    # A plain `with`, not an item of the `async with` above: the recorder is
+                    # synchronous, and naming it there raises TypeError before the graph
+                    # starts — every server run failed on entry that way, and only the real
+                    # worker in golden-e2e reached this line to show it. It wraps the graph
+                    # alone; the collection outlives the block, which only uninstalls it.
+                    with recording_provenance() as composed:
+                        if plan is not None:
+                            outcome = await runner.resume(
+                                checkpointer=saver, session_id=run_id, plan=plan, **ports
+                            )
+                        elif resume is None:
+                            outcome = await runner.run(
+                                checkpointer=saver,
+                                session_id=run_id,
+                                user_id=str(run.owner_id),
+                                query=run.question,
+                                depth=run.depth,
+                                **ports,
+                            )
+                        else:
+                            approved, feedback = resume
+                            outcome = await runner.resume(
+                                checkpointer=saver,
+                                session_id=run_id,
+                                approved=approved,
+                                feedback=feedback,
+                                **ports,
+                            )
+                    # `run` was loaded before the pipeline started and has been held since,
+                    # with `expire_on_commit=False`: a stop made mid-run is in the row and not
+                    # in the object. Re-read what `persist_outcome`'s guard decides on, or it
+                    # misses the stop, writes over CANCELLED, and `ck_run_cancelled` rolls the
+                    # spend back with the write (issue #54).
+                    await db.refresh(run, ["status", "cancelled_at"])
+                    # Read the state INSIDE the saver context: the evidence lives there and
+                    # the connection closes on exit.
+                    result = await persist_outcome(
+                        db, run, outcome, saver=saver, prompt_provenance=composed
+                    )
+
+                # Persist, commit, then publish — a client acting on COMPLETED must never
+                # re-read a status that has not caught up.
+                await db.commit()
+                observe_persisted(run, outcome, result)
+                await sink(run_id, lifecycle_event(result))
+                logger.info(
+                    "run_persisted",
+                    run_id=run_id,
+                    status=result.status,
+                    evidence_outcome=result.evidence_outcome,
+                    evidence=result.evidence_count,
+                    claims=result.claim_count,
+                )
+        finally:
+            await release_session_lock(run_id, lock_token)
+    finally:
+        await close_redis_pool()
+        await engine.dispose()
+
+
+def row_overrides(run: ResearchRun) -> dict:
+    """The `RunConfig` fields a run reads off its own row — one home for both run builders.
+
+    `run_config_for_run` here and `sidecar._drive_run` on the desktop both call this, so a
+    field added to the row reaches the engine on both hosts or on neither. That second hop,
+    row → `RunConfig`, is the one AGENTS.md records being forgotten: `corpus_mode` was on
+    the row while the server researched the open web, because installing the corpus port
+    only decides what `get_corpus()` answers — `retrievers.search` and
+    `tools.read_webpage` branch on this config and cannot see a database.
+    """
+    return {
+        "skip_plan_gate": bool(run.skip_plan_gate),
+        "topic_seeds": tuple(run.topic_seeds or ()),
+        "outline_template": run.outline_template,
+        "corpus_mode": bool(run.corpus_mode),
+        # Frozen at creation, read off the row, never re-resolved.
+        "corpus_allowed_ids": selection_ids_for_run(run),
+        "offline": bool(run.offline),
+    }
+
+
+def selection_ids_for_run(run: ResearchRun) -> frozenset[str] | None:
+    """The document-version ids this run may read, from its frozen selection.
+
+    One home for both run builders (`run_config_for_run` here, `sidecar._drive_run` on the
+    desktop), asserted by object identity like the other two-host rules. `None` for a run
+    with no recorded selection: a web run, or a corpus run created before selections
+    existed, which reads its project's whole corpus as it always did.
+    """
+    return corpus_selection.allowed_ids(run.corpus_selection)
+
+
+def corpus_port_for(store, config):
+    """The corpus port a run installs: its store, scoped to its selection when it has one.
+
+    Shared by both hosts so a selection cannot be enforced on one and forgotten on the
+    other (internal/rfcs/V3.1-corpus-scope.md §8.4).
+    """
+    from research_engine.corpus import ScopedCorpus
+
+    if config.corpus_allowed_ids is None:
+        return store
+    return ScopedCorpus(store, config.corpus_allowed_ids)
+
+
+async def record_corpus_snapshot(db: AsyncSession, run: ResearchRun, store) -> None:
+    """Stamp the corpus identity and version this run is about to read.
+
+    One home for both hosts. The server reaches it through `_corpus_port` and the desktop
+    through its own run driver, and `AGENTS.md` records what happens to a rule with two
+    homes — so this is asserted by object identity rather than kept in step by discipline.
+
+    A snapshot, not a lock. Nothing prevents the corpus changing while the run proceeds, and
+    nothing needs to: a superseded version stays readable, so evidence gathered before a
+    change still resolves to the bytes that were cited. What the pair records is the state
+    at the moment the corpus was opened, which is the claim a bundle can honestly make.
+    """
+    run.corpus_id, run.corpus_version = await store.identity()
+    await db.flush()
+
+
+async def _corpus_port(db: AsyncSession, run: ResearchRun, ports: dict) -> str | None:
+    """Attach the corpus store, or return the reason the run cannot proceed.
+
+    Both guards are the session worker's, unchanged: a remote embedder would egress the corpus,
+    and a missing corpus database means the documents were never ingested. Returning the
+    reason rather than raising keeps the caller's failure path in one place.
+    """
+    from app import adapters
+
+    embedder = await adapters.embeddings_for(ports["provider_keys"])
+    if not (embedder.model_id.startswith("ollama:") or embedder.model_id.startswith("local:")):
+        return f"Corpus mode requires a local embedder (Ollama), but got {embedder.model_id}."
+
+    store = await adapters.ServerCorpusLocator().for_project(
+        run.project_id, keys=ports["provider_keys"]
+    )
+    if store is None:
+        return f"Corpus database not found for project {run.project_id}. Ingest documents first."
+    ports["corpus"] = corpus_port_for(store, ports["run_config"])
+    await record_corpus_snapshot(db, run, store)
+    return None

@@ -1,0 +1,252 @@
+"""Retrieval scope for follow-up questions."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+import structlog
+
+from research_engine.embeddings import EmbeddingsUnavailable
+from research_engine.runconfig import get_run_config, reset_run_config, set_run_config
+
+logger = structlog.get_logger()
+
+#: The wire values. `everything` rather than the `auto` the plan sketched: the same plan
+#: requires each option to name "what it will and will not touch", and "auto" cannot —
+#: it describes who decides, not what is read.
+ChatScope = Literal["report", "corpus", "web", "everything"]
+
+SCOPES: tuple[ChatScope, ...] = ("report", "corpus", "web", "everything")
+
+#: How many results each retrieval source contributes to one turn. Deliberately small:
+#: a follow-up is a question, not a research run, and every extra excerpt is context the
+#: model spends attention on and the user pays for.
+_K = 5
+
+
+@dataclass(frozen=True)
+class ScopeDescription:
+    """The selector's copy, held next to the behaviour it describes.
+
+    `excludes` is not decoration. A scope that only stated what it *includes* would let
+    "Web" silently also read the corpus without the label ever becoming untrue.
+    """
+
+    label: str
+    reads: str
+    excludes: str
+
+
+_DESCRIPTIONS: dict[ChatScope, ScopeDescription] = {
+    "report": ScopeDescription(
+        label="This report",
+        reads="the finished report and the sources it already cites",
+        excludes="no new web search, no uploaded documents",
+    ),
+    "corpus": ScopeDescription(
+        label="My corpus",
+        # Both hosts read this, and from 3.1 both keep one corpus per project, so the
+        # per-project claim is true on each.
+        reads="only the documents uploaded to this project",
+        # The model call is a separate axis, governed by model routing, and is stated as
+        # such: the question and excerpts reach whichever model chat is routed to.
+        excludes=(
+            "no web search, and the question is never embedded off this machine; the "
+            "question and excerpts still go to the provider chat is routed to, which is a "
+            "cloud provider unless a local model was chosen"
+        ),
+    ),
+    "web": ScopeDescription(
+        label="Web",
+        reads="a live web search, returning sources the report did not have",
+        excludes="no uploaded documents",
+    ),
+    "everything": ScopeDescription(
+        label="Everything",
+        reads="finished research, your uploaded documents, and a live web search",
+        excludes="nothing is held back",
+    ),
+}
+
+
+def describe(scope: ChatScope) -> ScopeDescription:
+    return _DESCRIPTIONS[scope]
+
+
+@dataclass(frozen=True)
+class Grounding:
+    """Everything one chat turn is allowed to read, plus what could not be read.
+
+    `notes` is the honesty channel. A scope that found nothing and a scope that *failed*
+    look identical in the text block, and a model handed an empty block will fill the
+    silence — so the difference is stated to the model and returned to the client.
+    """
+
+    scope: ChatScope
+    text: str
+    #: New sources this turn introduced, numbered from 1 so the model's `[n]` markers
+    #: resolve against them. Empty for scopes that add none.
+    sources: list[dict] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def _wants(scope: ChatScope, source: str) -> bool:
+    if scope == "everything":
+        return True
+    return scope == source
+
+
+async def corpus_excerpts(*, store_factory, query: str, k: int = _K) -> list[dict]:
+    """Search the project's uploaded documents with the airgap guard armed.
+
+    `corpus_mode=True` is installed for exactly the duration of the search so
+    `CorpusStore.search` runs its own `_require_local_embedder_in_corpus_mode` check.
+    Raises `EmbeddingsUnavailable` when the configured embedder is remote — deliberately
+    not caught here, because "your question would have left the machine" is a decision
+    for the user, not a degradation to paper over.
+    """
+    store = store_factory()
+    if store is None:
+        return []
+    token = set_run_config(replace_corpus_mode(get_run_config(), True))
+    try:
+        return await store.search(query, k)
+    except EmbeddingsUnavailable:
+        # Re-raised untouched, and this clause must stay ABOVE the RuntimeError one:
+        # `EmbeddingsUnavailable` subclasses RuntimeError, so a lone `except RuntimeError`
+        # silently turns "your question would have left this machine" into a shrug. The
+        # airgap refusal is the user's decision to make, never a degradation to absorb.
+        raise
+    except RuntimeError as e:
+        # `CorpusStore.search` raises for "the corpus is empty" and for "indexed with a
+        # different embedding model". Both are correct for a *research run*, which must
+        # fail visibly rather than silently research nothing — but a chat turn is a
+        # question, and the honest answer is "there is nothing here to read", which the
+        # caller turns into a note the model is told about.
+        raise CorpusUnreadable(str(e)) from e
+    finally:
+        reset_run_config(token)
+
+
+class CorpusUnreadable(Exception):
+    """The corpus exists but cannot answer: empty, or indexed by another model."""
+
+
+def replace_corpus_mode(cfg, value: bool):
+    from dataclasses import replace
+
+    return replace(cfg, corpus_mode=value)
+
+
+def _format_sources(results: list[dict], start: int) -> tuple[str, list[dict]]:
+    """Number results from `start` and render them for a prompt.
+
+    Content is emitted verbatim under its own number, the same contract the report's
+    sources meet: what may be cited is exactly what is shown.
+    """
+    lines: list[str] = []
+    sources: list[dict] = []
+    for offset, r in enumerate(results):
+        index = start + offset
+        url = r.get("url", "")
+        title = r.get("title") or "(untitled)"
+        content = (r.get("content") or r.get("snippet") or "").strip()
+        lines.append(f'[{index}] {title}\n    Source: {url}\n    "{content}"')
+        sources.append({"index": index, "url": url, "title": title, "snippet": content})
+    return "\n".join(lines), sources
+
+
+async def gather(
+    scope: ChatScope,
+    *,
+    query: str,
+    report: str | None,
+    report_sources: list[dict],
+    memory_excerpts: str | None,
+    store_factory,
+) -> Grounding:
+    """Assemble the grounding for one chat turn.
+
+    `report` and `memory_excerpts` are the two surfaces' own native grounding — this
+    report's text on the session panel, the project's approved research on the project
+    panel. Both are "finished research I have already approved", which is why one scope
+    value covers them: the noun differs, the guarantee does not.
+    """
+    blocks: list[str] = []
+    notes: list[str] = []
+    sources: list[dict] = []
+
+    if _wants(scope, "report"):
+        if report:
+            blocks.append(f"--- THIS REPORT ---\n{report}")
+            if report_sources:
+                rendered, _ = _format_sources(report_sources, 1)
+                blocks.append(f"--- SOURCES ALREADY CITED ---\n{rendered}")
+        elif memory_excerpts:
+            blocks.append(f"--- APPROVED RESEARCH IN THIS PROJECT ---\n{memory_excerpts}")
+        else:
+            notes.append("No finished research is available to read for this question.")
+
+    if _wants(scope, "corpus"):
+        try:
+            results = await corpus_excerpts(store_factory=store_factory, query=query)
+        except CorpusUnreadable as e:
+            results = []
+            # The reason verbatim — "empty" and "indexed by a different model" have
+            # different fixes, and only one of them is "upload something".
+            notes.append(str(e))
+        if results:
+            rendered, added = _format_sources(results, len(sources) + 1)
+            blocks.append(f"--- CORPUS EXCERPTS (your uploaded documents) ---\n{rendered}")
+            sources.extend(added)
+        elif not notes:
+            # Distinguished from "found nothing relevant" on purpose: an empty project
+            # and an unhelpful search have different fixes, and only one of them is the
+            # user's to make.
+            notes.append(
+                "This project has no uploaded corpus, so no documents were searched."
+                if store_factory() is None
+                else "The uploaded corpus returned no passages matching this question."
+            )
+
+    if _wants(scope, "web"):
+        from research_engine import retrievers
+
+        try:
+            results = await retrievers.search(query, _K)
+        except Exception as e:  # noqa: BLE001 — surfaced, never swallowed (AGENTS.md)
+            logger.warning("chat_web_search_failed", error=str(e))
+            results = []
+            notes.append(f"The web search could not run: {e}")
+        if results:
+            rendered, added = _format_sources(list(results), len(sources) + 1)
+            blocks.append(f"--- WEB SEARCH RESULTS ---\n{rendered}")
+            sources.extend(added)
+        elif not notes:
+            notes.append("The web search returned no results for this question.")
+
+    return Grounding(scope=scope, text="\n\n".join(blocks), sources=sources, notes=notes)
+
+
+def system_suffix(grounding: Grounding) -> str:
+    """The scope contract appended to the chat system prompt.
+
+    Stated to the model as well as to the user, because the refusal line only works if
+    the model knows what it was and was not given — "the report doesn't cover this" is
+    the right answer when the scope excluded the place the answer lives.
+    """
+    described = describe(grounding.scope)
+    parts = [
+        f"RETRIEVAL SCOPE: {described.label}. You may use {described.reads} — "
+        f"{described.excludes}. Say plainly when the answer is not in what you were "
+        f"given; do not answer from your own knowledge, and do not apologise for the "
+        f"scope the user chose."
+    ]
+    if grounding.notes:
+        # The model is told what is missing so it can say so, rather than treating an
+        # absent block as "nothing relevant exists".
+        parts.append(
+            "GAPS IN WHAT YOU WERE GIVEN:\n" + "\n".join(f"- {n}" for n in grounding.notes)
+        )
+    return "\n\n".join(parts)

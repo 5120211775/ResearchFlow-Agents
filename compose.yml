@@ -1,0 +1,196 @@
+name: ${COMPOSE_PROJECT_NAME:-multi-agent}
+
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-research_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-research_db}
+  REDIS_URL: redis://redis:6379/0
+  CORPUS_DIR: /app/data/corpus
+
+x-test-environment: &test-environment
+  ENVIRONMENT: test
+  LLM_MODE: fake
+  DATABASE_URL: postgresql+asyncpg://research_user:test_password@postgres-test:5432/research_test_db
+  REDIS_URL: redis://redis-test:6379/0
+  JWT_SECRET_KEY: isolated-test-secret-012345678901234567890
+  CORPUS_DIR: /app/data/corpus
+  EMBEDDINGS_PROVIDER: auto
+  EMBEDDINGS_MODEL: ""
+  GOOGLE_API_KEY: ""
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  OPENROUTER_API_KEY: ""
+  CUSTOM_API_KEY: ""
+  CUSTOM_BASE_URL: ""
+  TAVILY_API_KEY: ""
+  BRAVE_API_KEY: ""
+  RESEARCH_API_PROXY: ""
+  MAX_PARALLEL_TASKS: "1"
+  MAX_CRITIC_LOOPS: "2"
+  MAX_INPUT_TOKENS: "100000"
+  MAX_WALLCLOCK_SECONDS: "120"
+  DEFAULT_MONTHLY_TOKEN_LIMIT: "0"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-research_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-research_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ${POSTGRES_USER:-research_user} -d ${POSTGRES_DB:-research_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  api:
+    image: multi-agent-api
+    build:
+      context: ./backend
+      target: api
+    env_file: [.env]
+    environment: *backend-environment
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: [corpus_data:/app/data]
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -fsS, "http://localhost:8000/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    image: multi-agent-worker
+    build:
+      context: ./backend
+      target: worker
+    env_file: [.env]
+    environment: *backend-environment
+    command: [celery, -A, app.workers.celery_app.celery_app, worker, "--concurrency=1", "--loglevel=info"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: [corpus_data:/app/data]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  ui:
+    image: multi-agent-ui
+    build: {context: ./ui, target: runtime}
+    environment:
+      API_BASE_URL: http://api:8000
+    ports: ["127.0.0.1:${UI_PORT:-8501}:8501"]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+  postgres-test:
+    profiles: [test]
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: research_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: research_test_db
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U research_user -d research_test_db]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis-test:
+    profiles: [test]
+    image: redis:7-alpine
+    command: [redis-server, --save, "", --appendonly, "no"]
+    tmpfs: [/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  test-api:
+    profiles: [test]
+    image: multi-agent-api
+    build: {context: ./backend, target: api}
+    environment: *test-environment
+    volumes: ["./backend/app:/app/app:ro", "./backend/research_engine:/app/research_engine:ro", test_corpus:/app/data]
+    ports: ["127.0.0.1:18000:8000"]
+    depends_on:
+      postgres-test: {condition: service_healthy}
+      redis-test: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -fsS, "http://localhost:8000/health/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  test-worker:
+    profiles: [test]
+    image: multi-agent-worker
+    build: {context: ./backend, target: worker}
+    environment: *test-environment
+    command: [celery, -A, app.workers.celery_app.celery_app, worker, "--concurrency=1", "--loglevel=info"]
+    volumes: ["./backend/app:/app/app:ro", "./backend/research_engine:/app/research_engine:ro", test_corpus:/app/data]
+    depends_on:
+      test-api: {condition: service_healthy}
+
+  test-ui:
+    profiles: [test]
+    image: multi-agent-ui
+    build: {context: ./ui, target: runtime}
+    environment: {API_BASE_URL: "http://test-api:8000"}
+    ports: ["127.0.0.1:18501:8501"]
+    depends_on:
+      test-api: {condition: service_healthy}
+
+  ui-tests:
+    profiles: [tools]
+    image: multi-agent-ui-tests
+    build: {context: ./ui, target: test}
+    environment:
+      API_BASE_URL: http://test-api:8000
+      PYTHONPATH: /workspace
+    volumes: ["./ui:/workspace/ui:ro"]
+    depends_on:
+      test-api: {condition: service_healthy}
+
+  backend-tests:
+    profiles: [tools]
+    image: multi-agent-tests
+    build: {context: ./backend, target: test}
+    environment:
+      <<: *test-environment
+      PYTHONPATH: /workspace/backend:/workspace
+    working_dir: /workspace/backend
+    volumes: ["./:/workspace:ro"]
+    depends_on:
+      postgres-test: {condition: service_healthy}
+      redis-test: {condition: service_healthy}
+    entrypoint: [python, -m, pytest]
+    command: ["-q", "-p", "no:cacheprovider"]
+
+volumes:
+  postgres_data: {name: "${POSTGRES_VOLUME:-multi_agent_postgres}"}
+  redis_data: {name: "${REDIS_VOLUME:-multi_agent_redis}"}
+  corpus_data: {name: "${CORPUS_VOLUME:-multi_agent_corpus}"}
+  test_corpus:
+

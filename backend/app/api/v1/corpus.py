@@ -1,0 +1,270 @@
+"""Corpus endpoints."""
+
+from __future__ import annotations
+
+import uuid
+
+import structlog
+from fastapi import APIRouter, Depends, Form, HTTPException, Response, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.v1.projects import resolve_project
+from app.db.base import get_db
+from app.dependencies import get_current_user
+from app.models.user import User
+from app.ports import CorpusLocator
+
+# Re-exported, not restated — see `app/schemas/corpus.py` for why the shapes moved, and
+# `app/services/corpus_ingest.py` for the validation and shaping both hosts share.
+from app.schemas.corpus import (
+    CorpusStatusResponse,
+    CorpusTreeResponse,
+    DocumentResponse,
+    ExtractedTextResponse,
+    FolderCreateRequest,
+    FolderDeleteResponse,
+    FolderResponse,
+    FolderUpdateRequest,
+)
+from app.services import corpus_ingest
+
+# The download response policy lives in a stdlib-only module so the desktop sidecar can
+# import it without dragging this route's `app.config` chain in with it (#50). Re-exported
+# here because this module is where callers and tests have always found it.
+from app.services.document_headers import (  # noqa: F401  (re-export)
+    _MEDIA_TYPES,
+    download_headers,
+    media_type_for,
+)
+from app.services.host_ports import get_corpus_locator
+from research_engine.corpus import CorpusStore, FolderNotFound
+
+logger = structlog.get_logger()
+router = APIRouter(prefix="/projects/{project_id}/corpus", tags=["Corpus"])
+
+
+async def _get_corpus_store(project_id: uuid.UUID, corpus: CorpusLocator) -> CorpusStore:
+    """This project's corpus, created if it does not exist yet.
+
+    Where it lives is the locator's to know — seven modules used to spell out the same
+    filename, and the last time that convention drifted, upload and run stopped seeing
+    the same corpus (AGENTS.md). `corpus` arrives via `Depends(get_corpus_locator)`
+    rather than a hardcoded `ServerCorpusLocator()` so the desktop can delegate to these
+    routes and pass its own locator over its one flat store explicitly.
+    """
+    return await corpus.ensure(project_id)
+
+
+@router.post("/documents", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
+async def upload_document(
+    project_id: uuid.UUID,
+    file: UploadFile,
+    # Optional and absent by default, so every client that predates document versioning
+    # keeps creating new logical documents exactly as before. Supplying it is the only way
+    # one upload becomes a revision of another: nothing is inferred from the filename,
+    # because two unrelated papers can legitimately share one.
+    doc_key: str | None = Form(default=None),
+    # The file's path inside a folder upload (`Thesis/Ch2/data.xlsx`). Files it into that
+    # folder path, creating folders as needed; absent, the document sits at the root.
+    relative_path: str | None = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Ingest a new document into the project's corpus.
+
+    Validation, failure mapping and the response shape come from
+    `app.services.corpus_ingest` — the one home for them, because the desktop serves this
+    same path and each host used to choose its own status codes for the same rejection.
+    """
+    # Enforce isolation: verify the user owns the project
+    await resolve_project(db, current_user.id, project_id)
+
+    store = await _get_corpus_store(project_id, corpus)
+    return await corpus_ingest.ingest_document(
+        store, file.filename, await file.read(), doc_key, relative_path
+    )
+
+
+@router.get("/documents", response_model=list[DocumentResponse])
+async def list_documents(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """List all documents in the project's corpus."""
+    await resolve_project(db, current_user.id, project_id)
+
+    store = await _get_corpus_store(project_id, corpus)
+    return [corpus_ingest.document_response(d) for d in await store.documents()]
+
+
+@router.get("/documents/{doc_id}/download")
+async def download_document(
+    project_id: uuid.UUID,
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Serve the original uploaded file so it can be opened in its native application.
+
+    `resolve_project` runs first and is the authorization boundary: document ids are
+    opaque but guessable in principle, and without the project check any authenticated
+    user could read another user's corpus by id.
+
+    Content-Type and disposition come from `download_headers`, which is where the rule
+    that an uploaded document must not render in this origin now lives — along with the
+    single narrow exception (PDF) that in-place preview needs.
+    """
+    await resolve_project(db, current_user.id, project_id)
+
+    store = await _get_corpus_store(project_id, corpus)
+    found = await store.blob(doc_id)
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No stored file for this document. Documents added before file "
+            "retention was enabled keep their searchable text but not the original.",
+        )
+    data, filename, kind = found
+    return Response(
+        content=data,
+        media_type=media_type_for(kind),
+        headers=download_headers(kind, filename),
+    )
+
+
+@router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    project_id: uuid.UUID,
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Delete a document from the project's corpus."""
+    await resolve_project(db, current_user.id, project_id)
+
+    store = await _get_corpus_store(project_id, corpus)
+    if not await store.delete(doc_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=corpus_ingest.DOCUMENT_NOT_FOUND
+        )
+    # Explicit, because returning `None` from a 204 route makes FastAPI send
+    # `content-type: application/json` with an empty body — a response that does not parse.
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/status", response_model=CorpusStatusResponse)
+async def get_status(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Get the status of the project's corpus."""
+    await resolve_project(db, current_user.id, project_id)
+
+    store = await _get_corpus_store(project_id, corpus)
+    return corpus_ingest.status_response(await store.status())
+
+
+# ── Folders (RFC V3.1 §7.1) ───────────────────────────────────────────────────────
+
+
+@router.get("/tree", response_model=CorpusTreeResponse)
+async def get_tree(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Every folder, document and membership of the project's corpus, as flat lists."""
+    await resolve_project(db, current_user.id, project_id)
+    store = await _get_corpus_store(project_id, corpus)
+    return CorpusTreeResponse(
+        folders=await store.folders(),
+        documents=[corpus_ingest.document_response(d) for d in await store.documents()],
+        memberships=await store.memberships(),
+    )
+
+
+@router.post("/folders", response_model=FolderResponse, status_code=status.HTTP_201_CREATED)
+async def create_folder(
+    project_id: uuid.UUID,
+    body: FolderCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    await resolve_project(db, current_user.id, project_id)
+    store = await _get_corpus_store(project_id, corpus)
+    try:
+        folder_id = await store.create_folder(body.name, body.parent_id)
+    except FolderNotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Folder not found.") from e
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    return FolderResponse(id=folder_id, parent_id=body.parent_id, name=body.name.strip())
+
+
+@router.patch("/folders/{folder_id}", response_model=FolderResponse)
+async def update_folder(
+    project_id: uuid.UUID,
+    folder_id: str,
+    body: FolderUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Rename (`name`) and/or move (`move: true` with `parent_id`, null for the root)."""
+    await resolve_project(db, current_user.id, project_id)
+    store = await _get_corpus_store(project_id, corpus)
+    try:
+        if body.move:
+            await store.update_folder(folder_id, name=body.name, parent_id=body.parent_id)
+        else:
+            await store.update_folder(folder_id, name=body.name)
+    except FolderNotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Folder not found.") from e
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    folder = next(f for f in await store.folders() if f["id"] == folder_id)
+    return FolderResponse(**folder)
+
+
+@router.delete("/folders/{folder_id}", response_model=FolderDeleteResponse)
+async def delete_folder(
+    project_id: uuid.UUID,
+    folder_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """Remove a folder and its subfolders. Documents filed only there are deleted with it."""
+    await resolve_project(db, current_user.id, project_id)
+    store = await _get_corpus_store(project_id, corpus)
+    try:
+        return FolderDeleteResponse(**await store.delete_folder(folder_id))
+    except FolderNotFound as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Folder not found.") from e
+
+
+@router.get("/documents/{doc_id}/text", response_model=ExtractedTextResponse)
+async def get_document_text(
+    project_id: uuid.UUID,
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    corpus: CorpusLocator = Depends(get_corpus_locator),
+):
+    """One version's canonical extracted text: what its citations' quotes are verified
+    against, so the preview highlights the cited span in exactly that text (RFC V3.1 §12)."""
+    await resolve_project(db, current_user.id, project_id)
+    store = await _get_corpus_store(project_id, corpus)
+    found = await store.extracted(doc_id)
+    if found is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=corpus_ingest.DOCUMENT_NOT_FOUND)
+    return ExtractedTextResponse(**found)

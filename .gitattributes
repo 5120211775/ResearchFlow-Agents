@@ -1,0 +1,2 @@
+# Linux entrypoints must survive a Windows checkout with core.autocrlf enabled.
+*.sh text eol=lf

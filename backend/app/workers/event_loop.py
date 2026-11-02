@@ -1,0 +1,112 @@
+"""One event loop per Celery worker process, shared by every task the process runs."""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import os
+import threading
+from collections.abc import Coroutine
+from typing import Any
+
+_runner: asyncio.Runner | None = None
+_runner_pid: int | None = None
+_runner_thread: int | None = None
+
+
+def _process_runner() -> asyncio.Runner:
+    global _runner, _runner_pid, _runner_thread
+    # A runner inherited through fork wraps the parent's selector; the child needs its own.
+    if _runner is None or _runner_pid != os.getpid():
+        # `loop_factory` keeps the runner from installing its loop as the thread's current
+        # one — nothing here reads it, and a test process has its own loop management.
+        _runner = asyncio.Runner(loop_factory=asyncio.new_event_loop)
+        _runner_pid = os.getpid()
+        _runner_thread = threading.get_ident()
+    elif _runner_thread != threading.get_ident():
+        # The provider clients this loop keeps valid are per *process*, so a threaded pool
+        # cannot be served either way: one loop per thread puts several loops on one cached
+        # client — the defect above — and a shared loop driven from two threads is undefined.
+        raise RuntimeError(
+            "app.workers.event_loop.run was called from a second thread; one event loop per "
+            "worker process requires Celery's prefork (the default) or solo pool"
+        )
+    return _runner
+
+
+def run[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Run one Celery task's coroutine to completion on this process's loop."""
+    try:
+        runner = _process_runner()
+    except RuntimeError:
+        coro.close()  # never started; closed so the refusal is the only thing reported
+        raise
+    root: list[asyncio.Task] = []
+
+    async def as_root() -> T:
+        root.append(asyncio.current_task())
+        return await coro
+
+    try:
+        # A fresh copy per task: `asyncio.Runner` otherwise reuses one context for every
+        # call, and the log identity bound just before this call would never be seen.
+        return runner.run(as_root(), context=contextvars.copy_context())
+    finally:
+        loop = runner.get_loop()
+        if root and not root[0].done():
+            _unwind(loop, root[0])
+        _cancel_leftovers(loop)
+
+
+def _unwind(loop: asyncio.AbstractEventLoop, root: asyncio.Task) -> None:
+    """Cancel an interrupted task's own coroutine and let it unwind before anything else.
+
+    Celery's soft time limit raises out of the loop from a signal handler, leaving the task's
+    coroutine pending mid-await. Cancelling it alone first sends the cancellation down the
+    structured path — the fan-out cancels its children, `emit` lets a shielded event write
+    land, the driver's `finally` releases its lock and closes its session. Cancelling every
+    task at once would also cancel that shielded write directly, cutting a commit in half.
+    """
+    root.cancel()
+    loop.run_until_complete(asyncio.wait([root]))
+    if not root.cancelled() and root.exception() is not None:
+        loop.call_exception_handler(
+            {
+                "message": "a Celery task's coroutine raised while unwinding after an interruption",
+                "exception": root.exception(),
+                "task": root,
+            }
+        )
+
+
+def _cancel_leftovers(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and await whatever the task left running, as a per-task loop's close did."""
+    leftovers = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    if not leftovers:
+        return
+    for task in leftovers:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*leftovers, return_exceptions=True))
+    for task in leftovers:
+        if not task.cancelled() and task.exception() is not None:
+            loop.call_exception_handler(
+                {
+                    "message": "a task left running by a finished Celery task raised",
+                    "exception": task.exception(),
+                    "task": task,
+                }
+            )
+
+
+def shutdown() -> None:
+    """Close this process's loop; the next `run` opens a new one.
+
+    Wired to Celery's `worker_process_shutdown` (`celery_app`), so a child's loop has a defined
+    end rather than being abandoned to interpreter exit.
+    """
+    global _runner, _runner_pid, _runner_thread
+    if _runner is not None and _runner_pid == os.getpid():
+        _runner.close()
+    _runner = None
+    _runner_pid = None
+    _runner_thread = None

@@ -1,0 +1,198 @@
+import enum
+import uuid
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base
+from app.models.types import JsonType, UuidType
+
+
+class SessionStatus(enum.StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    # Paused at the research design gate (internal/07 Phase 4) — the planner has proposed
+    # tasks and an outline and is waiting on the reviewer, before any search has spent
+    # anything. Distinct from AWAITING_APPROVAL rather than a shared "paused": the two
+    # gates resume with different payloads, so a client that could not tell them apart
+    # would offer "Approve draft" for a draft that does not exist yet.
+    AWAITING_PLAN = "AWAITING_PLAN"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UuidType, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UuidType,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Every session lives in a project (docs/14 §3). Existing rows were backfilled into
+    # a per-user "General" project by migration 0005, which is why this is NOT NULL.
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UuidType,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[SessionStatus] = mapped_column(
+        SAEnum(SessionStatus, name="session_status"),
+        nullable=False,
+        default=SessionStatus.PENDING,
+        index=True,
+    )
+    research_depth: Mapped[str] = mapped_column(String(20), nullable=False, default="balanced")
+    draft_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Numbered citation table the UI renders: [{index, url, title, snippet}] (docs/05 §1).
+    sources: Mapped[list | None] = mapped_column(JsonType, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Money as Numeric — never float (docs/05 §5).
+    total_cost_usd: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False, default=0)
+    total_tokens_input: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens_output: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    elapsed_seconds: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    rework_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Archiving is reversible and keeps the row; deletion is a separate, hard action.
+    # Timestamp rather than a boolean so "when did this leave the active list" is
+    # answerable without a second column.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: When the user stopped this run, or NULL if they never did (issue #54).
+    #:
+    #: Durable on purpose. Cancellation used to be advisory — a status flip plus a Redis key
+    #: with a 1h TTL that nothing ever read — so the run kept going and its outcome writer
+    #: moved the session back out of the stopped state when it finished. Both outcome
+    #: writers now consult `is_cancelled` before touching status, and they can only do that
+    #: if the answer outlives a worker restart.
+    #:
+    #: A timestamp rather than a flag, matching `research_runs.cancelled_at` on the run side:
+    #: when a user stopped a run is worth keeping, and it tells a cancelled run apart from
+    #: one that failed on its own without adding a status to the vocabulary both hosts map.
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Which models actually produced this report (docs/12 M8). Snapshotted at run time
+    # rather than read back from the user's current preference, because a preference can
+    # change afterwards and a report has to stay attributable to what wrote it — the same
+    # reason the approval decision is recorded in the audit log.
+    model_routing: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+
+    # How much of this report's citation apparatus resolves (internal/07 Phase 7).
+    # **Nullable, and NULL means "not measured"** — a report that made no citable claims,
+    # or a session predating this column. A `0.0` here would mean "every marker points at
+    # nothing", which is the opposite finding; storing the two as one value is the
+    # unmeasured-vs-zero bug this codebase exists to refuse.
+    citation_resolution_rate: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+
+    # Airgapped corpus mode (docs/12 M10).
+    corpus_mode: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+
+    # This run used scripted models and fixture retrievers rather than a real provider
+    # (docs/17 §6.2). Persisted rather than inferred from the process's LLM_MODE, because
+    # every export path must be able to stamp the artifact long after the run — and
+    # because a report that cannot prove it is a demo is exactly the kind of unverifiable
+    # output this product exists to refuse.
+    demo: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+
+    # This session's owner had usable prompt overrides and this path did not apply them.
+    # Sessions predate the AgentSpec override contract and are not gaining it — runs are the
+    # product, and the session path stays readable rather than deepened. Recording the fact
+    # is the honest alternative to a report that quietly ignored a configuration its owner
+    # set: the reader is told, rather than left to assume the overrides took effect.
+    prompt_overrides_not_applied: Mapped[bool] = mapped_column(
+        nullable=False, server_default="false", default=False
+    )
+
+    # ── Plan gate (internal/07 Phase 4) ────────────────────────────────────────
+    # The reviewer's decision, not the planner's proposal — plan_json/outline_json
+    # hold the request as edited at the gate, same as model_routing snapshots what
+    # actually ran rather than a current, possibly-since-changed preference.
+    plan_json: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    outline_json: Mapped[dict | None] = mapped_column(JsonType, nullable=True)
+    plan_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Whether this run skipped the design gate. Both hosts' start endpoints always set
+    # it explicitly from `ResearchStartRequest.skip_plan_gate`, so the `false` server
+    # default below is reached only by a row created outside those endpoints — it is
+    # kept as-is because migration 0012 shipped it and a column default that says
+    # "gated" is the safer thing for a row nobody claimed.
+    #
+    # The request's own default is the opposite (True — skip), and deliberately so: the
+    # gate is the product default *for the app*, where the run form sends `false`
+    # explicitly, but a script POSTing last week's JSON must not start pausing at a gate
+    # it cannot see or resume. `RunConfig.skip_plan_gate` defaults to True for the same
+    # reason one layer down, covering the CLI and the eval harness.
+    skip_plan_gate: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    # What the researcher asked for at start time, as opposed to what they decided at the
+    # gate (`plan_json`/`outline_json` above). Persisted rather than passed through the
+    # queue because `RunConfig` is rebuilt from this row on every resume, and a field that
+    # only existed on the original request would silently become empty the second time.
+    topic_seeds: Mapped[list | None] = mapped_column(JsonType, nullable=True)
+    outline_template: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Whether the user stopped this run.
+
+        The one definition both hosts read. `pipeline_runner._persist_outcome` and
+        `sidecar._apply_outcome` are the two homes of the outcome-writing rule, and a
+        predicate each re-derived would be a third thing to keep in step.
+        """
+        return self.cancelled_at is not None
+
+    # Relationships. passive_deletes lets the DB-level ON DELETE CASCADE do the work
+    # instead of the ORM loading every child row (docs/05 §5).
+    user: Mapped[User] = relationship("User", back_populates="sessions")  # noqa: F821
+    project: Mapped[Project] = relationship("Project", back_populates="sessions")  # noqa: F821
+    # `agent_logs.session_id` is polymorphic across sessions and runs and carries no
+    # foreign key, so the relationship states the join condition explicitly and cascades in
+    # the ORM rather than relying on the database. `viewonly=False` with `delete-orphan` is
+    # what keeps "delete this session removes its trace" true without an FK.
+    agent_logs: Mapped[list[AgentLog]] = relationship(  # noqa: F821
+        "AgentLog",
+        primaryjoin="Session.id == foreign(AgentLog.session_id)",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+    # `memory_chunks.source_report_id` is polymorphic across both run tables for the same
+    # reason `agent_logs.session_id` is, and so also has no foreign key and no database
+    # cascade. Deleting a session must still take its indexed text with it, or project chat
+    # keeps quoting a report nobody can open.
+    #
+    # **Read-only, and the deletion is explicit** (`memory.purge_report`, called by both
+    # hosts' delete routes). This carried `cascade="all, delete-orphan"`, which made
+    # `db.delete(session)` SELECT `memory_chunks` in order to cascade into it — and that
+    # table is pgvector-backed and absent from the desktop's schema, so session deletion
+    # answered 500 on every use of a control the desktop build renders. A cascade is a
+    # promise that the table is there; on one host it is not.
+    memory_chunks: Mapped[list[MemoryChunk]] = relationship(  # noqa: F821
+        "MemoryChunk",
+        primaryjoin="Session.id == foreign(MemoryChunk.source_report_id)",
+        viewonly=True,
+        lazy="select",
+        overlaps="project,memory_chunks",
+    )
+    chat_messages: Mapped[list[ChatMessage]] = relationship(  # noqa: F821
+        "ChatMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="select",
+        order_by="ChatMessage.created_at",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Session id={self.id} status={self.status}>"

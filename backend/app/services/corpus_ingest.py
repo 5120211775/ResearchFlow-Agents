@@ -1,0 +1,176 @@
+"""The one corpus upload contract, for both hosts."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from app import metrics
+from app.errors import DependencyUnavailable, Invalid, PayloadTooLarge, Unprocessable
+from app.schemas.corpus import CorpusStatusResponse, DocumentResponse
+from research_engine.corpus import UnknownDocumentKey
+from research_engine.documents import MAX_DOCUMENT_BYTES
+
+__all__ = [
+    "MAX_DOCUMENT_BYTES",
+    "clean_upload",
+    "document_response",
+    "ingest_document",
+    "ingested_response",
+    "status_response",
+]
+
+#: 404 for a document that is not in this corpus. One string, so the two hosts stop
+#: differing by a full stop — a difference a client matching on the message still sees.
+DOCUMENT_NOT_FOUND = "Document not found."
+
+
+def clean_upload(filename: str | None, data: bytes) -> str:
+    """Validate one upload and return the name to store it under.
+
+    A size refusal is its own error rather than another `Invalid`: it tells a client the
+    request was well-formed and simply too big, and it is the only one of these the server
+    did not enforce at all before.
+    """
+    name = Path(filename or "").name  # metadata only; never a path
+    if not name:
+        raise Invalid("A filename is required.")
+    if not data:
+        raise Invalid("The document is empty.")
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise PayloadTooLarge(
+            f"The document is {len(data)} bytes; the limit is {MAX_DOCUMENT_BYTES}."
+        )
+    return name
+
+
+#: Bounds on an uploaded relative path (RFC V3.1 §13): deep enough for any real folder tree,
+#: shallow enough that a crafted path cannot grow the folder table without limit.
+MAX_PATH_DEPTH = 32
+MAX_COMPONENT_CHARS = 255
+
+
+def folder_components(relative_path: str | None) -> list[str]:
+    """The folders a relative upload path names, outermost first — never a filesystem path.
+
+    `Thesis/Ch2/data.xlsx` → `["Thesis", "Ch2"]`. Split on both separators; empty, `.` and
+    `..` components refused rather than resolved, so no path can climb out of the corpus or
+    name the same folder two ways. Unicode is NFC-normalised so a name typed on two systems
+    lands in one folder. These are folder *names* stored as data; nothing touches a disk.
+    """
+    import unicodedata
+
+    if not relative_path:
+        return []
+    parts = [unicodedata.normalize("NFC", p) for p in relative_path.replace("\\", "/").split("/")]
+    if any(not p.strip() or p.strip() in (".", "..") or "\0" in p for p in parts):
+        raise Invalid("The folder path contains an empty, '.' or '..' part.")
+    folders = [p.strip() for p in parts[:-1]]
+    if len(folders) > MAX_PATH_DEPTH:
+        raise Invalid(f"Folders are limited to {MAX_PATH_DEPTH} levels deep.")
+    if any(len(p) > MAX_COMPONENT_CHARS for p in folders):
+        raise Invalid(f"Folder names are limited to {MAX_COMPONENT_CHARS} characters.")
+    return folders
+
+
+async def ingest_document(
+    store,
+    filename: str,
+    data: bytes,
+    doc_key: str | None = None,
+    relative_path: str | None = None,
+) -> DocumentResponse:
+    """Validate, ingest, and answer in the shared shape.
+
+    With `relative_path`, the document is also filed in that folder path, creating any
+    folder that does not exist. The same bytes uploaded into a second folder are one
+    document with a second membership, not a second copy (RFC V3.1 §7.1).
+
+    Both failure mappings are here rather than at the call sites. An unsupported format is
+    the caller's mistake (`Invalid`); an unreachable embedding server is not
+    (`DependencyUnavailable`), and telling them apart is the difference between "fix your
+    file" and "try again later".
+
+    Every exit also counts itself. This is the one upload contract both hosts call, so a
+    counter here is the same number on the server and the desktop; a counter at the four
+    routes would be four numbers to keep in step. The outcome is a closed label and never
+    carries the refusal's message, which names the file.
+    """
+    from research_engine.embeddings import EmbeddingsUnavailable
+
+    try:
+        name = clean_upload(filename, data)
+        folders = folder_components(relative_path)
+        result = await store.ingest(name, data, doc_key=doc_key)
+    except UnknownDocumentKey as e:
+        # 422 rather than 400, and refused rather than absorbed: the request was
+        # well-formed and named a document this corpus does not hold. Creating a new
+        # logical document instead would answer 201 to a request that meant "replace".
+        metrics.observe_ingest("rejected")
+        raise Unprocessable(f"No document with key {e.args[0]} in this corpus.") from e
+    except Invalid, PayloadTooLarge:  # `clean_upload` refused it
+        metrics.observe_ingest("rejected")
+        raise
+    except ValueError as e:  # unsupported extension, unreadable document
+        metrics.observe_ingest("rejected")
+        raise Invalid(str(e)) from e
+    except EmbeddingsUnavailable as e:
+        metrics.observe_ingest("unavailable")
+        raise DependencyUnavailable(str(e)) from e
+    if folders and result.doc_id and result.doc_id != "skip":
+        folder_id = await store.ensure_folder_path(folders)
+        key = result.doc_key or await store.doc_key_of(result.doc_id)
+        if key and folder_id:
+            await store.add_membership(key, folder_id, name)
+    # A document the store already held is `skipped` — a success that indexed nothing, so
+    # it must not add to the byte total a throughput figure is computed from.
+    metrics.observe_ingest("skipped" if result.skipped else "ingested", byte_count=len(data))
+    return ingested_response(result)
+
+
+def ingested_response(result) -> DocumentResponse:
+    """`Ingested` → the client shape.
+
+    `doc_id` is `None` when the store recognised the document and skipped it; the server
+    has always reported that as the literal `"skip"`, and a client distinguishes it from a
+    real id by value.
+    """
+    return DocumentResponse(
+        id=result.doc_id or "skip",
+        filename=result.filename,
+        chunks=result.chunks_written,
+        doc_key=result.doc_key,
+        version=result.version,
+    )
+
+
+def document_response(row: dict) -> DocumentResponse:
+    """`CorpusStore.documents()`'s row → the client shape.
+
+    The store's own field names are not the contract: it says `chunk_count` and
+    `ingested_at` where the API says `chunks` and `created_at`. This mapping existed in
+    three places — twice on the server and once on the desktop — and the desktop's copy
+    also wrapped the list in `{"documents": [...]}`, which `useCorpusDocuments` types as a
+    bare array, so `.length` read `undefined` and the Corpus page showed "no documents"
+    for a corpus that was never empty.
+    """
+    return DocumentResponse(
+        id=row["id"],
+        filename=row["filename"],
+        chunks=row["chunk_count"],
+        created_at=row.get("ingested_at"),
+        size_bytes=row.get("size_bytes"),
+        downloadable=row.get("downloadable", False),
+        origin=row.get("origin", "uploaded"),
+        doc_key=row.get("doc_key"),
+        version=row.get("version"),
+        is_current=row.get("is_current", True),
+    )
+
+
+def status_response(stat: dict) -> CorpusStatusResponse:
+    """`CorpusStore.status()` → the client shape.
+
+    The top-level `chunks` total is computed here because the store does not carry one,
+    and the desktop's copy of this route never summed it at all.
+    """
+    return CorpusStatusResponse(**{**stat, "chunks": sum(stat["chunks_by_model"].values())})
